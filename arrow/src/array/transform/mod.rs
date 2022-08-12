@@ -313,11 +313,7 @@ fn preallocate_offset_and_binary_buffer<Offset: OffsetSizeTrait>(
     // offsets
     let mut buffer = MutableBuffer::new((1 + capacity) * mem::size_of::<Offset>());
     // safety: `unsafe` code assumes that this buffer is initialized with one element
-    if Offset::IS_LARGE {
-        buffer.push(0i64);
-    } else {
-        buffer.push(0i32)
-    }
+    buffer.push(Offset::zero());
 
     [
         buffer,
@@ -674,8 +670,6 @@ mod tests {
     use std::{convert::TryFrom, sync::Arc};
 
     use super::*;
-
-    use crate::array::BasicDecimalArray;
     use crate::array::Decimal128Array;
     use crate::{
         array::{

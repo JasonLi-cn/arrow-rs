@@ -19,6 +19,9 @@
 //! [Apache Parquet](https://parquet.apache.org/), part of
 //! the [Apache Arrow](https://arrow.apache.org/) project.
 //!
+//! Please see the [parquet crates.io](https://crates.io/crates/parquet)
+//! page for feature flags and tips to improve performance.
+//!
 //! # Getting Started
 //! Start with some examples:
 //!
@@ -30,14 +33,6 @@
 //!
 //! 3. [arrow::async_reader] for `async` reading and writing parquet
 //! files to Arrow `RecordBatch`es (requires the `async` feature).
-#![allow(dead_code)]
-#![allow(non_camel_case_types)]
-#![allow(
-    clippy::from_over_into,
-    clippy::new_without_default,
-    clippy::or_fun_call,
-    clippy::too_many_arguments
-)]
 
 /// Defines a an item with an experimental public API
 ///

@@ -15,19 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use num::BigInt;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::array::array_decimal::{BasicDecimalArray, Decimal256Array};
+use crate::array::array_decimal::Decimal256Array;
 use crate::array::ArrayRef;
 use crate::array::Decimal128Array;
 use crate::array::{ArrayBuilder, FixedSizeBinaryBuilder};
 
 use crate::error::{ArrowError, Result};
 
-use crate::datatypes::{validate_decimal256_precision, validate_decimal_precision};
-use crate::util::decimal::{BasicDecimal, Decimal256};
+use crate::datatypes::{
+    validate_decimal256_precision_with_lt_bytes, validate_decimal_precision,
+};
+use crate::util::decimal::Decimal256;
 
 /// Array Builder for [`Decimal128Array`]
 ///
@@ -201,9 +202,7 @@ impl Decimal256Builder {
     pub fn append_value(&mut self, value: &Decimal256) -> Result<()> {
         let value = if self.value_validation {
             let raw_bytes = value.raw_value();
-            let integer = BigInt::from_signed_bytes_le(raw_bytes);
-            let value_str = integer.to_string();
-            validate_decimal256_precision(&value_str, self.precision)?;
+            validate_decimal256_precision_with_lt_bytes(raw_bytes, self.precision)?;
             value
         } else {
             value
@@ -256,9 +255,9 @@ impl Decimal256Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use num::Num;
+    use num::{BigInt, Num};
 
-    use crate::array::array_decimal::{BasicDecimalArray, Decimal128Array};
+    use crate::array::array_decimal::Decimal128Array;
     use crate::array::{array_decimal, Array};
     use crate::datatypes::DataType;
     use crate::util::decimal::{Decimal128, Decimal256};
@@ -305,21 +304,21 @@ mod tests {
     fn test_decimal256_builder() {
         let mut builder = Decimal256Builder::new(30, 40, 6);
 
-        let mut bytes = vec![0; 32];
+        let mut bytes = [0_u8; 32];
         bytes[0..16].clone_from_slice(&8_887_000_000_i128.to_le_bytes());
-        let value = Decimal256::try_new_from_bytes(40, 6, bytes.as_slice()).unwrap();
+        let value = Decimal256::try_new_from_bytes(40, 6, &bytes).unwrap();
         builder.append_value(&value).unwrap();
 
         builder.append_null();
 
-        bytes = vec![255; 32];
-        let value = Decimal256::try_new_from_bytes(40, 6, bytes.as_slice()).unwrap();
+        bytes = [255; 32];
+        let value = Decimal256::try_new_from_bytes(40, 6, &bytes).unwrap();
         builder.append_value(&value).unwrap();
 
-        bytes = vec![0; 32];
+        bytes = [0; 32];
         bytes[0..16].clone_from_slice(&0_i128.to_le_bytes());
         bytes[15] = 128;
-        let value = Decimal256::try_new_from_bytes(40, 6, bytes.as_slice()).unwrap();
+        let value = Decimal256::try_new_from_bytes(40, 6, &bytes).unwrap();
         builder.append_value(&value).unwrap();
 
         builder.append_option(None::<&Decimal256>).unwrap();
@@ -349,9 +348,9 @@ mod tests {
     fn test_decimal256_builder_unmatched_precision_scale() {
         let mut builder = Decimal256Builder::new(30, 10, 6);
 
-        let mut bytes = vec![0; 32];
+        let mut bytes = [0_u8; 32];
         bytes[0..16].clone_from_slice(&8_887_000_000_i128.to_le_bytes());
-        let value = Decimal256::try_new_from_bytes(40, 6, bytes.as_slice()).unwrap();
+        let value = Decimal256::try_new_from_bytes(40, 6, &bytes).unwrap();
         builder.append_value(&value).unwrap();
     }
 

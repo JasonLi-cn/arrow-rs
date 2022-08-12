@@ -17,7 +17,7 @@
 
 [package]
 name = "arrow"
-version = "19.0.0"
+version = "20.0.0"
 description = "Rust implementation of Apache Arrow"
 homepage = "https://github.com/apache/arrow-rs"
 repository = "https://github.com/apache/arrow-rs"
@@ -37,8 +37,13 @@ name = "arrow"
 path = "src/lib.rs"
 bench = false
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ahash = { version = "0.8", default-features = false, features=["compile-time-rng"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ahash = { version = "0.8", default-features = false, features=["runtime-rng"] }
+
 [dependencies]
-ahash = { version = "0.7", default-features = false }
 serde = { version = "1.0", default-features = false }
 serde_derive = { version = "1.0", default-features = false }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
@@ -73,11 +78,13 @@ prettyprint = ["comfy-table"]
 # an optional dependency for supporting compile to wasm32-unknown-unknown
 # target without assuming an environment containing JavaScript.
 test_utils = ["rand"]
-pyarrow = ["pyo3"]
+pyarrow = ["pyo3", "ffi"]
 # force_validate runs full data validation for all arrays that are created
 # this is not enabled by default as it is too computationally expensive
 # but is run as part of our CI checks
 force_validate = []
+# Enable ffi support
+ffi = []
 
 [dev-dependencies]
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
@@ -90,6 +97,7 @@ tempfile = { version = "3", default-features = false }
 [[example]]
 name = "dynamic_types"
 required-features = ["prettyprint"]
+path="./examples/dynamic_types.rs"
 
 [[bench]]
 name = "aggregate_kernels"
@@ -200,4 +208,8 @@ required-features = ["test_utils"]
 
 [[bench]]
 name = "array_data_validate"
+harness = false
+
+[[bench]]
+name = "decimal_validate"
 harness = false
