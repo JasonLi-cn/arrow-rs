@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Command"],"fn":["construct_record_batch_from_params","execute_flight","main","parse_key_val","setup_client","setup_logging"],"struct":["Args","ClientArgs","KeyValue"]};
