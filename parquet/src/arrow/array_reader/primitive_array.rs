@@ -16,41 +16,77 @@
 // under the License.
 
 use crate::arrow::array_reader::{read_records, skip_records, ArrayReader};
-use crate::arrow::record_reader::buffer::ScalarValue;
 use crate::arrow::record_reader::RecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Type as PhysicalType;
 use crate::column::page::PageIterator;
-use crate::data_type::DataType;
+use crate::data_type::{DataType, Int96};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
-use arrow::array::{
-    ArrayDataBuilder, ArrayRef, BooleanArray, BooleanBufferBuilder,
-    Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
+use arrow_array::Decimal256Array;
+use arrow_array::{
+    builder::TimestampNanosecondBufferBuilder, ArrayRef, BooleanArray, Decimal128Array,
+    Float32Array, Float64Array, Int32Array, Int64Array, TimestampNanosecondArray, UInt32Array,
+    UInt64Array,
 };
-use arrow::buffer::Buffer;
-use arrow::datatypes::DataType as ArrowType;
+use arrow_buffer::{i256, BooleanBuffer, Buffer};
+use arrow_data::ArrayDataBuilder;
+use arrow_schema::{DataType as ArrowType, TimeUnit};
 use std::any::Any;
 use std::sync::Arc;
+
+/// Provides conversion from `Vec<T>` to `Buffer`
+pub trait IntoBuffer {
+    fn into_buffer(self) -> Buffer;
+}
+
+macro_rules! native_buffer {
+    ($($t:ty),*) => {
+        $(impl IntoBuffer for Vec<$t> {
+            fn into_buffer(self) -> Buffer {
+                Buffer::from_vec(self)
+            }
+        })*
+    };
+}
+native_buffer!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
+
+impl IntoBuffer for Vec<bool> {
+    fn into_buffer(self) -> Buffer {
+        BooleanBuffer::from_iter(self).into_inner()
+    }
+}
+
+impl IntoBuffer for Vec<Int96> {
+    fn into_buffer(self) -> Buffer {
+        let mut builder = TimestampNanosecondBufferBuilder::new(self.len());
+        for v in self {
+            builder.append(v.to_nanos())
+        }
+        builder.finish()
+    }
+}
 
 /// Primitive array readers are leaves of array reader tree. They accept page iterator
 /// and read them into primitive arrays.
 pub struct PrimitiveArrayReader<T>
-    where
-        T: DataType,
-        T::T: ScalarValue,
+where
+    T: DataType,
+    T::T: Copy + Default,
+    Vec<T::T>: IntoBuffer,
 {
     data_type: ArrowType,
     pages: Box<dyn PageIterator>,
-    def_levels_buffer: Option<Buffer>,
-    rep_levels_buffer: Option<Buffer>,
+    def_levels_buffer: Option<Vec<i16>>,
+    rep_levels_buffer: Option<Vec<i16>>,
     record_reader: RecordReader<T>,
 }
 
 impl<T> PrimitiveArrayReader<T>
-    where
-        T: DataType,
-        T::T: ScalarValue,
+where
+    T: DataType,
+    T::T: Copy + Default,
+    Vec<T::T>: IntoBuffer,
 {
     /// Construct primitive array reader.
     pub fn new(
@@ -80,9 +116,10 @@ impl<T> PrimitiveArrayReader<T>
 
 /// Implementation of primitive array reader.
 impl<T> ArrayReader for PrimitiveArrayReader<T>
-    where
-        T: DataType,
-        T::T: ScalarValue,
+where
+    T: DataType,
+    T::T: Copy + Default,
+    Vec<T::T>: IntoBuffer,
 {
     fn as_any(&self) -> &dyn Any {
         self
@@ -98,7 +135,7 @@ impl<T> ArrayReader for PrimitiveArrayReader<T>
     }
 
     fn consume_batch(&mut self) -> Result<ArrayRef> {
-        let target_type = self.get_data_type().clone();
+        let target_type = &self.data_type;
         let arrow_data_type = match T::get_physical_type() {
             PhysicalType::BOOLEAN => ArrowType::Boolean,
             PhysicalType::INT32 => {
@@ -123,28 +160,19 @@ impl<T> ArrayReader for PrimitiveArrayReader<T>
             }
             PhysicalType::FLOAT => ArrowType::Float32,
             PhysicalType::DOUBLE => ArrowType::Float64,
-            PhysicalType::INT96
-            | PhysicalType::BYTE_ARRAY
-            | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
-                unreachable!(
-                    "PrimitiveArrayReaders don't support complex physical types"
-                );
+            PhysicalType::INT96 => match target_type {
+                ArrowType::Timestamp(TimeUnit::Nanosecond, _) => target_type.clone(),
+                _ => unreachable!("INT96 must be timestamp nanosecond"),
+            },
+            PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                unreachable!("PrimitiveArrayReaders don't support complex physical types");
             }
         };
 
         // Convert to arrays by using the Parquet physical type.
         // The physical types are then cast to Arrow types if necessary
 
-        let mut record_data = self.record_reader.consume_record_data();
-
-        if T::get_physical_type() == PhysicalType::BOOLEAN {
-            let mut boolean_buffer = BooleanBufferBuilder::new(record_data.len());
-
-            for e in record_data.as_slice() {
-                boolean_buffer.append(*e > 0);
-            }
-            record_data = boolean_buffer.finish();
-        }
+        let record_data = self.record_reader.consume_record_data().into_buffer();
 
         let array_data = ArrayDataBuilder::new(arrow_data_type)
             .len(self.record_reader.num_values())
@@ -152,18 +180,23 @@ impl<T> ArrayReader for PrimitiveArrayReader<T>
             .null_bit_buffer(self.record_reader.consume_bitmap_buffer());
 
         let array_data = unsafe { array_data.build_unchecked() };
-        let array = match T::get_physical_type() {
-            PhysicalType::BOOLEAN => Arc::new(BooleanArray::from(array_data)) as ArrayRef,
-            PhysicalType::INT32 => Arc::new(Int32Array::from(array_data)) as ArrayRef,
-            PhysicalType::INT64 => Arc::new(Int64Array::from(array_data)) as ArrayRef,
-            PhysicalType::FLOAT => Arc::new(Float32Array::from(array_data)) as ArrayRef,
-            PhysicalType::DOUBLE => Arc::new(Float64Array::from(array_data)) as ArrayRef,
-            PhysicalType::INT96
-            | PhysicalType::BYTE_ARRAY
-            | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
-                unreachable!(
-                    "PrimitiveArrayReaders don't support complex physical types"
-                );
+        let array: ArrayRef = match T::get_physical_type() {
+            PhysicalType::BOOLEAN => Arc::new(BooleanArray::from(array_data)),
+            PhysicalType::INT32 => match array_data.data_type() {
+                ArrowType::UInt32 => Arc::new(UInt32Array::from(array_data)),
+                ArrowType::Int32 => Arc::new(Int32Array::from(array_data)),
+                _ => unreachable!(),
+            },
+            PhysicalType::INT64 => match array_data.data_type() {
+                ArrowType::UInt64 => Arc::new(UInt64Array::from(array_data)),
+                ArrowType::Int64 => Arc::new(Int64Array::from(array_data)),
+                _ => unreachable!(),
+            },
+            PhysicalType::FLOAT => Arc::new(Float32Array::from(array_data)),
+            PhysicalType::DOUBLE => Arc::new(Float64Array::from(array_data)),
+            PhysicalType::INT96 => Arc::new(TimestampNanosecondArray::from(array_data)),
+            PhysicalType::BYTE_ARRAY | PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                unreachable!("PrimitiveArrayReaders don't support complex physical types");
             }
         };
 
@@ -180,8 +213,8 @@ impl<T> ArrayReader for PrimitiveArrayReader<T>
         let array = match target_type {
             ArrowType::Date64 => {
                 // this is cheap as it internally reinterprets the data
-                let a = arrow::compute::cast(&array, &ArrowType::Date32)?;
-                arrow::compute::cast(&a, &target_type)?
+                let a = arrow_cast::cast(&array, &ArrowType::Date32)?;
+                arrow_cast::cast(&a, target_type)?
             }
             ArrowType::Decimal128(p, s) => {
                 let array = match array.data_type() {
@@ -190,7 +223,7 @@ impl<T> ArrayReader for PrimitiveArrayReader<T>
                         .downcast_ref::<Int32Array>()
                         .unwrap()
                         .iter()
-                        .map(|v| v.map(|v| v.into()))
+                        .map(|v| v.map(|v| v as i128))
                         .collect::<Decimal128Array>(),
 
                     ArrowType::Int64 => array
@@ -198,7 +231,7 @@ impl<T> ArrayReader for PrimitiveArrayReader<T>
                         .downcast_ref::<Int64Array>()
                         .unwrap()
                         .iter()
-                        .map(|v| v.map(|v| v.into()))
+                        .map(|v| v.map(|v| v as i128))
                         .collect::<Decimal128Array>(),
                     _ => {
                         return Err(arrow_err!(
@@ -207,11 +240,39 @@ impl<T> ArrayReader for PrimitiveArrayReader<T>
                         ));
                     }
                 }
-                    .with_precision_and_scale(p, s)?;
+                .with_precision_and_scale(*p, *s)?;
 
                 Arc::new(array) as ArrayRef
             }
-            _ => arrow::compute::cast(&array, &target_type)?,
+            ArrowType::Decimal256(p, s) => {
+                let array = match array.data_type() {
+                    ArrowType::Int32 => array
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.map(|v| i256::from_i128(v as i128)))
+                        .collect::<Decimal256Array>(),
+
+                    ArrowType::Int64 => array
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.map(|v| i256::from_i128(v as i128)))
+                        .collect::<Decimal256Array>(),
+                    _ => {
+                        return Err(arrow_err!(
+                            "Cannot convert {:?} to decimal",
+                            array.data_type()
+                        ));
+                    }
+                }
+                .with_precision_and_scale(*p, *s)?;
+
+                Arc::new(array) as ArrayRef
+            }
+            _ => arrow_cast::cast(&array, target_type)?,
         };
 
         // save definition and repetition buffers
@@ -226,11 +287,11 @@ impl<T> ArrayReader for PrimitiveArrayReader<T>
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
-        self.def_levels_buffer.as_ref().map(|buf| buf.typed_data())
+        self.def_levels_buffer.as_deref()
     }
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
-        self.rep_levels_buffer.as_ref().map(|buf| buf.typed_data())
+        self.rep_levels_buffer.as_deref()
     }
 }
 
@@ -245,12 +306,12 @@ mod tests {
     use crate::schema::types::SchemaDescriptor;
     use crate::util::test_common::rand_gen::make_pages;
     use crate::util::InMemoryPageIterator;
-    use arrow::array::{Array, PrimitiveArray};
-    use arrow::datatypes::{ArrowPrimitiveType};
+    use arrow::datatypes::ArrowPrimitiveType;
+    use arrow_array::{Array, PrimitiveArray};
 
+    use arrow::datatypes::DataType::Decimal128;
     use rand::distributions::uniform::SampleUniform;
     use std::collections::VecDeque;
-    use arrow::datatypes::DataType::Decimal128;
 
     #[allow(clippy::too_many_arguments)]
     fn make_column_chunks<T: DataType>(
@@ -308,15 +369,12 @@ mod tests {
             .map(|t| Arc::new(SchemaDescriptor::new(Arc::new(t))))
             .unwrap();
 
-        let column_desc = schema.column(0);
-        let page_iterator = EmptyPageIterator::new(schema);
-
         let mut array_reader = PrimitiveArrayReader::<Int32Type>::new(
-            Box::new(page_iterator),
-            column_desc,
+            Box::<EmptyPageIterator>::default(),
+            schema.column(0),
             None,
         )
-            .unwrap();
+        .unwrap();
 
         // expect no values to be read
         let array = array_reader.next_batch(50).unwrap();
@@ -355,15 +413,11 @@ mod tests {
                 true,
                 2,
             );
-            let page_iterator =
-                InMemoryPageIterator::new(schema, column_desc.clone(), page_lists);
+            let page_iterator = InMemoryPageIterator::new(page_lists);
 
-            let mut array_reader = PrimitiveArrayReader::<Int32Type>::new(
-                Box::new(page_iterator),
-                column_desc,
-                None,
-            )
-                .unwrap();
+            let mut array_reader =
+                PrimitiveArrayReader::<Int32Type>::new(Box::new(page_iterator), column_desc, None)
+                    .unwrap();
 
             // Read first 50 values, which are all from the first column chunk
             let array = array_reader.next_batch(50).unwrap();
@@ -387,7 +441,15 @@ mod tests {
     }
 
     macro_rules! test_primitive_array_reader_one_type {
-        ($arrow_parquet_type:ty, $physical_type:expr, $converted_type_str:expr, $result_arrow_type:ty, $result_arrow_cast_type:ty, $result_primitive_type:ty) => {{
+        (
+            $arrow_parquet_type:ty,
+            $physical_type:expr,
+            $converted_type_str:expr,
+            $result_arrow_type:ty,
+            $result_arrow_cast_type:ty,
+            $result_primitive_type:ty
+            $(, $timezone:expr)?
+        ) => {{
             let message_type = format!(
                 "
             message test_schema {{
@@ -419,11 +481,7 @@ mod tests {
                     true,
                     2,
                 );
-                let page_iterator = InMemoryPageIterator::new(
-                    schema.clone(),
-                    column_desc.clone(),
-                    page_lists,
-                );
+                let page_iterator = InMemoryPageIterator::new(page_lists);
                 let mut array_reader = PrimitiveArrayReader::<$arrow_parquet_type>::new(
                     Box::new(page_iterator),
                     column_desc.clone(),
@@ -446,7 +504,9 @@ mod tests {
                             result_data_type
                         )
                         .as_str(),
-                    );
+                    )
+                    $(.clone().with_timezone($timezone))?
+                    ;
 
                 // create expected array as primitive, and cast to result type
                 let expected = PrimitiveArray::<$result_arrow_cast_type>::from(
@@ -469,7 +529,9 @@ mod tests {
                             result_data_type
                         )
                         .as_str(),
-                    );
+                    )
+                    $(.clone().with_timezone($timezone))?
+                    ;
                 assert_eq!(expected, array);
             }
         }};
@@ -507,7 +569,8 @@ mod tests {
             "TIMESTAMP_MILLIS",
             arrow::datatypes::TimestampMillisecondType,
             arrow::datatypes::Int64Type,
-            i64
+            i64,
+            "UTC"
         );
         test_primitive_array_reader_one_type!(
             crate::data_type::Int64Type,
@@ -515,7 +578,8 @@ mod tests {
             "TIMESTAMP_MICROS",
             arrow::datatypes::TimestampMicrosecondType,
             arrow::datatypes::Int64Type,
-            i64
+            i64,
+            "UTC"
         );
     }
 
@@ -555,15 +619,11 @@ mod tests {
                 2,
             );
 
-            let page_iterator =
-                InMemoryPageIterator::new(schema, column_desc.clone(), page_lists);
+            let page_iterator = InMemoryPageIterator::new(page_lists);
 
-            let mut array_reader = PrimitiveArrayReader::<Int32Type>::new(
-                Box::new(page_iterator),
-                column_desc,
-                None,
-            )
-                .unwrap();
+            let mut array_reader =
+                PrimitiveArrayReader::<Int32Type>::new(Box::new(page_iterator), column_desc, None)
+                    .unwrap();
 
             let mut accu_len: usize = 0;
 
@@ -605,7 +665,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_primitive_array_reader_decimal_types() {
         // parquet `INT32` to decimal
@@ -636,26 +695,34 @@ mod tests {
                 true,
                 2,
             );
-            let page_iterator =
-                InMemoryPageIterator::new(schema, column_desc.clone(), page_lists);
+            let page_iterator = InMemoryPageIterator::new(page_lists);
 
-            let mut array_reader = PrimitiveArrayReader::<Int32Type>::new(
-                Box::new(page_iterator),
-                column_desc,
-                None,
-            )
-                .unwrap();
+            let mut array_reader =
+                PrimitiveArrayReader::<Int32Type>::new(Box::new(page_iterator), column_desc, None)
+                    .unwrap();
 
             // read data from the reader
             // the data type is decimal(8,2)
             let array = array_reader.next_batch(50).unwrap();
             assert_eq!(array.data_type(), &Decimal128(8, 2));
             let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            let data_decimal_array = data[0..50].iter().copied().map(|v| Some(v as i128)).collect::<Decimal128Array>().with_precision_and_scale(8, 2).unwrap();
+            let data_decimal_array = data[0..50]
+                .iter()
+                .copied()
+                .map(|v| Some(v as i128))
+                .collect::<Decimal128Array>()
+                .with_precision_and_scale(8, 2)
+                .unwrap();
             assert_eq!(array, &data_decimal_array);
 
             // not equal with different data type(precision and scale)
-            let data_decimal_array = data[0..50].iter().copied().map(|v| Some(v as i128)).collect::<Decimal128Array>().with_precision_and_scale(9, 0).unwrap();
+            let data_decimal_array = data[0..50]
+                .iter()
+                .copied()
+                .map(|v| Some(v as i128))
+                .collect::<Decimal128Array>()
+                .with_precision_and_scale(9, 0)
+                .unwrap();
             assert_ne!(array, &data_decimal_array)
         }
 
@@ -687,26 +754,34 @@ mod tests {
                 true,
                 2,
             );
-            let page_iterator =
-                InMemoryPageIterator::new(schema, column_desc.clone(), page_lists);
+            let page_iterator = InMemoryPageIterator::new(page_lists);
 
-            let mut array_reader = PrimitiveArrayReader::<Int64Type>::new(
-                Box::new(page_iterator),
-                column_desc,
-                None,
-            )
-                .unwrap();
+            let mut array_reader =
+                PrimitiveArrayReader::<Int64Type>::new(Box::new(page_iterator), column_desc, None)
+                    .unwrap();
 
             // read data from the reader
             // the data type is decimal(18,4)
             let array = array_reader.next_batch(50).unwrap();
             assert_eq!(array.data_type(), &Decimal128(18, 4));
             let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            let data_decimal_array = data[0..50].iter().copied().map(|v| Some(v as i128)).collect::<Decimal128Array>().with_precision_and_scale(18, 4).unwrap();
+            let data_decimal_array = data[0..50]
+                .iter()
+                .copied()
+                .map(|v| Some(v as i128))
+                .collect::<Decimal128Array>()
+                .with_precision_and_scale(18, 4)
+                .unwrap();
             assert_eq!(array, &data_decimal_array);
 
             // not equal with different data type(precision and scale)
-            let data_decimal_array = data[0..50].iter().copied().map(|v| Some(v as i128)).collect::<Decimal128Array>().with_precision_and_scale(34, 0).unwrap();
+            let data_decimal_array = data[0..50]
+                .iter()
+                .copied()
+                .map(|v| Some(v as i128))
+                .collect::<Decimal128Array>()
+                .with_precision_and_scale(34, 0)
+                .unwrap();
             assert_ne!(array, &data_decimal_array)
         }
     }

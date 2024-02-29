@@ -78,7 +78,7 @@ git submodule update --init
 
 This populates data in two git submodules:
 
-- `../parquet_testing/data` (sourced from https://github.com/apache/parquet-testing.git)
+- `../parquet-testing/data` (sourced from https://github.com/apache/parquet-testing.git)
 - `../testing` (sourced from https://github.com/apache/arrow-testing)
 
 By default, `cargo test` will look for these directories at their
@@ -150,7 +150,7 @@ If the file already exists, to avoid mistakenly **overriding**, you MAY have to 
 the link source or file content. Else if not exist, let's safely soft link [pre-commit.sh](pre-commit.sh) as file `.git/hooks/pre-commit`:
 
 ```bash
-ln -s  ../../rust/pre-commit.sh .git/hooks/pre-commit
+ln -s  ../../pre-commit.sh .git/hooks/pre-commit
 ```
 
 If sometimes you want to commit without checking, just run `git commit` with `--no-verify`:

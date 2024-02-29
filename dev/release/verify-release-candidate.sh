@@ -113,19 +113,13 @@ test_source_distribution() {
   export ARROW_TEST_DATA=$PWD/arrow-testing-data/data
   export PARQUET_TEST_DATA=$PWD/parquet-testing-data/data
 
-  # use local modules because we don't publish modules to crates.io yet
-  sed \
-    -i.bak \
-    -E \
-    -e 's/^arrow = "([^"]*)"/arrow = { version = "\1", path = "..\/arrow" }/g' \
-    -e 's/^parquet = "([^"]*)"/parquet = { version = "\1", path = "..\/parquet" }/g' \
-    */Cargo.toml
-
-  cargo build
   cargo test --all
 
-  # verify that the crates can be published to crates.io
-  pushd arrow
+  # verify that the leaf crates can be published to crates.io
+  # we can't verify crates that depend on others
+  # (because the others haven't yet been published to crates.io)
+
+  pushd arrow-buffer
     cargo publish --dry-run
   popd
 

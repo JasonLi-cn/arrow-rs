@@ -16,9 +16,8 @@
 // under the License.
 
 use crate::arrow::ProjectionMask;
-use arrow::array::BooleanArray;
-use arrow::error::Result as ArrowResult;
-use arrow::record_batch::RecordBatch;
+use arrow_array::{BooleanArray, RecordBatch};
+use arrow_schema::ArrowError;
 
 /// A predicate operating on [`RecordBatch`]
 pub trait ArrowPredicate: Send + 'static {
@@ -30,9 +29,11 @@ pub trait ArrowPredicate: Send + 'static {
     /// Evaluate this predicate for the given [`RecordBatch`] containing the columns
     /// identified by [`Self::projection`]
     ///
-    /// Rows that are `true` in the returned [`BooleanArray`] will be returned by the
-    /// parquet reader, whereas rows that are `false` or `Null` will not be
-    fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray>;
+    /// Must return a  [`BooleanArray`] that has the same length as the input
+    /// `batch` where each row indicates whether the row should be returned:
+    /// * `true`:the row should be returned
+    /// * `false` or `null`: the row should not be returned
+    fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError>;
 }
 
 /// An [`ArrowPredicate`] created from an [`FnMut`]
@@ -43,7 +44,7 @@ pub struct ArrowPredicateFn<F> {
 
 impl<F> ArrowPredicateFn<F>
 where
-    F: FnMut(RecordBatch) -> ArrowResult<BooleanArray> + Send + 'static,
+    F: FnMut(RecordBatch) -> Result<BooleanArray, ArrowError> + Send + 'static,
 {
     /// Create a new [`ArrowPredicateFn`]. `f` will be passed batches
     /// that contains the columns specified in `projection`
@@ -56,13 +57,13 @@ where
 
 impl<F> ArrowPredicate for ArrowPredicateFn<F>
 where
-    F: FnMut(RecordBatch) -> ArrowResult<BooleanArray> + Send + 'static,
+    F: FnMut(RecordBatch) -> Result<BooleanArray, ArrowError> + Send + 'static,
 {
     fn projection(&self) -> &ProjectionMask {
         &self.projection
     }
 
-    fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
+    fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
         (self.f)(batch)
     }
 }
@@ -95,7 +96,7 @@ where
 /// leaves 99% of the rows, it may be better to not filter the data from parquet and
 /// apply the filter after the RecordBatch has been fully decoded.
 ///
-/// [`RowSelection`]: [super::selection::RowSelection]
+/// [`RowSelection`]: crate::arrow::arrow_reader::RowSelection
 pub struct RowFilter {
     /// A list of [`ArrowPredicate`]
     pub(crate) predicates: Vec<Box<dyn ArrowPredicate>>,

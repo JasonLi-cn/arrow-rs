@@ -18,8 +18,8 @@
 //! Logic for reading into arrow arrays
 
 use crate::errors::Result;
-use arrow::array::ArrayRef;
-use arrow::datatypes::DataType as ArrowType;
+use arrow_array::ArrayRef;
+use arrow_schema::DataType as ArrowType;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -28,13 +28,13 @@ use crate::arrow::record_reader::GenericRecordReader;
 use crate::column::page::PageIterator;
 use crate::column::reader::decoder::ColumnValueDecoder;
 use crate::file::reader::{FilePageIterator, FileReader};
-use crate::schema::types::SchemaDescPtr;
 
 mod builder;
 mod byte_array;
 mod byte_array_dictionary;
-mod complex_object_array;
 mod empty_array;
+mod fixed_len_byte_array;
+mod fixed_size_list_array;
 mod list_array;
 mod map_array;
 mod null_array;
@@ -47,7 +47,8 @@ mod test_util;
 pub use builder::build_array_reader;
 pub use byte_array::make_byte_array_reader;
 pub use byte_array_dictionary::make_byte_array_dictionary_reader;
-pub use complex_object_array::ComplexObjectArrayReader;
+pub use fixed_len_byte_array::make_fixed_len_byte_array_reader;
+pub use fixed_size_list_array::FixedSizeListArrayReader;
 pub use list_array::ListArrayReader;
 pub use map_array::MapArrayReader;
 pub use null_array::NullArrayReader;
@@ -98,22 +99,15 @@ pub trait ArrayReader: Send {
 }
 
 /// A collection of row groups
-pub trait RowGroupCollection {
-    /// Get schema of parquet file.
-    fn schema(&self) -> SchemaDescPtr;
-
-    /// Get the numer of rows in this collection
+pub trait RowGroups {
+    /// Get the number of rows in this collection
     fn num_rows(&self) -> usize;
 
-    /// Returns an iterator over the column chunks for particular column
+    /// Returns a [`PageIterator`] for the column chunks with the given leaf column index
     fn column_chunks(&self, i: usize) -> Result<Box<dyn PageIterator>>;
 }
 
-impl RowGroupCollection for Arc<dyn FileReader> {
-    fn schema(&self) -> SchemaDescPtr {
-        self.metadata().file_metadata().schema_descr_ptr()
-    }
-
+impl RowGroups for Arc<dyn FileReader> {
     fn num_rows(&self) -> usize {
         self.metadata().file_metadata().num_rows() as usize
     }
@@ -134,8 +128,8 @@ fn read_records<V, CV>(
     batch_size: usize,
 ) -> Result<usize>
 where
-    V: ValuesBuffer + Default,
-    CV: ColumnValueDecoder<Slice = V::Slice>,
+    V: ValuesBuffer,
+    CV: ColumnValueDecoder<Buffer = V>,
 {
     let mut records_read = 0usize;
     while records_read < batch_size {
@@ -158,7 +152,7 @@ where
     Ok(records_read)
 }
 
-/// Uses `record_reader` to skip up to `batch_size` records from`pages`
+/// Uses `record_reader` to skip up to `batch_size` records from `pages`
 ///
 /// Returns the number of records skipped, which can be less than `batch_size` if
 /// pages is exhausted
@@ -167,9 +161,9 @@ fn skip_records<V, CV>(
     pages: &mut dyn PageIterator,
     batch_size: usize,
 ) -> Result<usize>
-    where
-        V: ValuesBuffer + Default,
-        CV: ColumnValueDecoder<Slice = V::Slice>,
+where
+    V: ValuesBuffer,
+    CV: ColumnValueDecoder<Buffer = V>,
 {
     let mut records_skipped = 0usize;
     while records_skipped < batch_size {
